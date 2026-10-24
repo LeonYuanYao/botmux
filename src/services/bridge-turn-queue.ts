@@ -162,6 +162,13 @@ export interface BridgePendingTurn {
   carriedAcrossGeneration?: boolean;
   /** Observed at least one non-error assistant event (including tool calls). */
   hasAssistantActivity?: boolean;
+  /** Per-turn monotonic counter bumped whenever a non-sidechain, non-error
+   *  assistant record is attributed to the turn while it is collecting. The
+   *  worker's no-idle watchdog snapshots it when arming and restarts its bound
+   *  whenever it grows: a final message flushed block-by-block seconds apart
+   *  (every block stamped with the terminal stop_reason) must be measured from
+   *  the LAST block ("transcript quiet 2s"), not from the first one. */
+  attributedActivitySeq?: number;
   /** Set on a Lark turn whose input Claude Code folded into the turn already
    *  running (a mid-turn system reminder) instead of starting its own. It has
    *  no reply of its own and ends when that turn ends — see `absorbedTurns`. */
@@ -325,8 +332,10 @@ export class BridgeTurnQueue {
    *  error can still follow a text record), and an idle-expired verdict
    *  already settles on the stop_reason. */
   isFreshHeadAwaitingMarker(turn: BridgePendingTurn): boolean {
+    // `!durationMarkerWaitExpired` needs no term of its own: with no marker
+    // seen yet, isAwaitingDurationMarker's (durationMarkerSeen || !waitExpired)
+    // gate reduces exactly to !durationMarkerWaitExpired.
     return !this.durationMarkerSeen
-      && !this.durationMarkerWaitExpired
       && this.isAwaitingDurationMarker(turn);
   }
   /** True while `turn` is held for its duration marker: its terminal so far is
@@ -644,6 +653,8 @@ export class BridgeTurnQueue {
         }
         if (this.collecting) {
           this.collecting.hasAssistantActivity = true;
+          this.collecting.attributedActivitySeq
+            = (this.collecting.attributedActivitySeq ?? 0) + 1;
         }
         if (hasVisibleText) this.collecting?.assistantUuids.push(uuid);
         if (this.collecting && onAssistantAttributed) {

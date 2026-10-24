@@ -8836,6 +8836,13 @@ let idleTranscriptSettleInFlight = false;
  *  one starts. The handle is BOUND to one turn + transcript generation, so a
  *  deadline left by a completed/rotated turn can never settle the new head. */
 let provisionalExitTimer: ReturnType<typeof setTimeout> | null = null;
+/** Identity + activity snapshot the armed deadline belongs to. Whenever ingest
+ *  attributes NEW records to this same turn, its bound restarts: the bound is
+ *  "2s of transcript QUIET", not "2s after the first terminal block" — a final
+ *  message flushed block-by-block seconds apart would otherwise settle on a
+ *  truncated body (worst case a thinking-only block with zero answer uuids). */
+let provisionalExitBoundTurn: BridgePendingTurn | null = null;
+let provisionalExitBoundActivitySeq = 0;
 /** Bumped on every transcript switch. The watchdog's deadline belongs to one
  *  generation; a rotation arms the next turn's own deadline fresh. */
 let bridgeTranscriptGeneration = 0;
@@ -8877,12 +8884,13 @@ function beginNewBridgeTranscriptGeneration(): void {
   bridgeQueue.resetDurationMarkerVerdicts();
 }
 
-/** Read-only binding of the armed watchdog (tests and debug logs). */
+/** Void the armed deadline and its turn binding. */
 function disarmProvisionalExitWatch(): void {
   if (provisionalExitTimer) {
     clearTimeout(provisionalExitTimer);
     provisionalExitTimer = null;
   }
+  provisionalExitBoundTurn = null;
 }
 
 /** Re-evaluate the watchdog after transcript ingest. When a fresh turn's head
@@ -8891,17 +8899,37 @@ function disarmProvisionalExitWatch(): void {
  *  onTimeout would (and drains the turn). The deadline is bound to that exact
  *  turn + transcript generation: a deadline left by a completed or rotated
  *  turn is void and can never settle the new head — the new head gets its own
- *  deadline armed on its next ingest. A journal-restored head is a dead
- *  writer's snapshot: it still needs the exit to settle, but must not teach the
- *  current CLI that it is marker-less. */
+ *  deadline armed on its next ingest. While armed, NEW assistant records
+ *  attributed to the SAME bound turn restart the bound, so a split final
+ *  message whose blocks flush more than one bound apart settles with its whole
+ *  body instead of its first block. A journal-restored head is a dead writer's
+ *  snapshot: it still needs the exit to settle, but must not teach the current
+ *  CLI that it is marker-less. */
 function updateProvisionalExitWatch(): void {
-  if (provisionalExitTimer || idleTranscriptSettleInFlight) return;
+  if (idleTranscriptSettleInFlight) return;
   if (!bridgeJsonlPath || lastInitConfig?.adoptMode) return;
   const head = bridgeQueue.peek()[0];
   if (!head || head.isLocal || !bridgeQueue.isFreshHeadAwaitingMarker(head)) return;
+  if (provisionalExitTimer) {
+    if (provisionalExitBoundTurn === head) {
+      // Same turn: extend ONLY when it received new attributed records; on
+      // transcript quiet the old deadline keeps running. New bytes for any
+      // other turn (a follower became head after the bound turn closed) are
+      // handled in the branch below.
+      if ((head.attributedActivitySeq ?? 0) <= provisionalExitBoundActivitySeq) return;
+      disarmProvisionalExitWatch();
+    } else {
+      // The armed deadline belongs to a turn already gone from the head
+      // (closed normally while it was running). Its identity gate can never
+      // emit THIS turn, so drop it and arm the current head its own window
+      // now instead of letting the stale timer skew the new bound.
+      disarmProvisionalExitWatch();
+    }
+  }
   const boundTurn = head;
   const boundGeneration = bridgeTranscriptGeneration;
-  const boundRestored = !!head.restoredFromJournal || !!head.carriedAcrossGeneration;
+  provisionalExitBoundTurn = boundTurn;
+  provisionalExitBoundActivitySeq = boundTurn.attributedActivitySeq ?? 0;
   const reArm = (): void => {
     // The voided deadline belonged to an older head: give the CURRENT head its
     // own full window now (it may already be waiting) rather than holding it
@@ -8910,6 +8938,7 @@ function updateProvisionalExitWatch(): void {
   };
   provisionalExitTimer = setTimeout(() => {
     provisionalExitTimer = null;
+    provisionalExitBoundTurn = null;
     if (boundGeneration !== bridgeTranscriptGeneration) { reArm(); return; }
     // Drain unread bytes FIRST, then verify. A global drain called here would
     // itself ingest and could hand the head to a following type-ahead turn;
@@ -8942,6 +8971,12 @@ function updateProvisionalExitWatch(): void {
     // busy forever with the composer on screen) is exactly the shape this
     // fallback must rescue, so a held working status overrides the visible
     // prompt and the fallback fires.
+    // Boundary note: Claude's own readyPattern (/❯/) also matches while it is
+    // busy, so screenShowsPrompt() is structurally true for Claude and the
+    // held-working check is the real discriminator there. Adapters without an
+    // OSC status never hold `working`, so they stand down on the visible
+    // prompt and the fallback structurally never fires for them — they keep
+    // relying on the idle edge, by design.
     const heldWorking = idleDetector?.programStatusHeldWorking() === true;
     const idleImminent = idleDetector?.isIdleNow()
       || idleTranscriptSettleInFlight
@@ -8954,7 +8989,10 @@ function updateProvisionalExitWatch(): void {
     //    API error): a normal explicit drain sends exactly its real outcome.
     // onlyTurn stops the drain before any follower regardless.
     if (bridgeQueue.isFreshHeadAwaitingMarker(current)) {
-      if (!boundRestored) noteBridgeTurnCloseWaitExpired();
+      // The helper itself excludes a restored/carried head (a dead writer's
+      // snapshot must not teach THIS writer it is marker-less); the exclusion
+      // has this single home, so no extra guard is taken here.
+      noteBridgeTurnCloseWaitExpired();
       // No explicitTerminalOnly → emitReadyTurns uses its terminal-boundary
       // drain; onlyTurn keeps it to the bound turn.
       emitReadyTurns({
@@ -8966,6 +9004,13 @@ function updateProvisionalExitWatch(): void {
         onlyTurn: { turnId: boundTurn.turnId, dispatchAttempt: boundTurn.dispatchAttempt },
       });
     }
+    // bridgeIngest() above armed a fresh deadline against the pre-drain head
+    // (this callback cleared the armed handle on entry). Whatever the queue
+    // now holds — the bound turn already popped, or a gate withheld it — that
+    // deadline is stale: void it and let the CURRENT head earn its own window
+    // instead of waiting for this one to misfire and skew its bound.
+    disarmProvisionalExitWatch();
+    updateProvisionalExitWatch();
   }, PROVISIONAL_EXIT_WATCH_MS);
   provisionalExitTimer.unref?.();
 }

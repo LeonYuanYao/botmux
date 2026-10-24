@@ -294,6 +294,7 @@ describe('provisional-exit watchdog (no idle edge fallback)', () => {
     const queue = new BridgeTurnQueue();
     const drained: unknown[] = [];
     let watchdogTimer: ReturnType<typeof setTimeout> | null = null;
+    let boundTurn: unknown = null;
     const scope: Record<string, unknown> = {
       bridgeQueue: queue,
       bridgeJsonlPath: path,
@@ -301,9 +302,15 @@ describe('provisional-exit watchdog (no idle edge fallback)', () => {
       idleTranscriptSettleInFlight: false,
       get provisionalExitTimer() { return watchdogTimer; },
       set provisionalExitTimer(v) { watchdogTimer = v; },
+      get provisionalExitBoundTurn() { return boundTurn; },
+      set provisionalExitBoundTurn(v) { boundTurn = v; },
       bridgeTranscriptGeneration: 0,
+      // Mirror production disarmProvisionalExitWatch exactly: clear the bound
+      // turn as well as the timer, or future tests on this seam would observe
+      // state production can never hold.
       disarmProvisionalExitWatch: () => {
         if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; }
+        boundTurn = null;
       },
       PROVISIONAL_EXIT_WATCH_MS: 2_000,
       idleDetector: {
@@ -379,6 +386,150 @@ describe('provisional-exit watchdog (no idle edge fallback)', () => {
     h.update();
     h.advance(2_001);
     expect(h.drains()).toBe(1);
+  });
+
+  it('restarts the bound when the SAME turn keeps flushing blocks (split final, held working)', () => {
+    // Claude writes the final message one block per flush, each stamped with
+    // stop_reason. Anchoring the bound at the FIRST block settles the turn on
+    // a truncated body: the bound must measure transcript QUIET — new records
+    // attributed to the bound turn restart it.
+    const h = harness({ heldWorking: true });
+    h.queue.mark('om_first', makeFingerprint('first prompt'), 100, 'first prompt', 1);
+    h.queue.ingest([user('u1', 'first prompt'), textFinal('a-text1', 'first part')]);
+    h.update();
+    h.advance(1_500); // original deadline would be t=2000
+    // The remaining block lands AFTER that, within one flush gap of its own.
+    h.queue.ingest([textFinal('a-text2', 'second part')]);
+    h.update();
+    h.advance(1_999); // t=3499: restarted bound (t=3500) has not fired
+    expect(h.drains()).toBe(0);
+    h.advance(2);
+    expect(h.drains()).toBe(1);
+    // The wait-expired settlement carries BOTH blocks, not just the first.
+    const emitted = h.drainedTurns() as Array<{ turnId: string; assistantUuids: string[] }>;
+    expect(emitted.map(t => [t.turnId, t.assistantUuids])).toEqual([
+      ['om_first', ['a-text1', 'a-text2']],
+    ]);
+  });
+
+  it('does not emit a zero-uuid completion when the first flushed block is thinking-only', () => {
+    // Worst truncation shape: first block = thinking, text body flushes only
+    // after the original bound. The old anchor fired with zero answer uuids
+    // and the later body was synthesised into a suppressed local turn — the
+    // user got an empty reply and the body vanished. Restarting on the bound
+    // turn's new blocks settles WITH the body.
+    const h = harness({ heldWorking: true });
+    h.queue.mark('om_first', makeFingerprint('first prompt'), 100, 'first prompt', 1);
+    h.queue.ingest([user('u1', 'first prompt'), thinkingOnly('a-think')]);
+    h.update();
+    h.advance(1_500);
+    h.queue.ingest([textFinal('a-text', 'the real answer')]);
+    h.update();
+    h.advance(1_999); // t=3499: original t=2000 deadline passed, restarted one open
+    expect(h.drains()).toBe(0);
+    h.advance(2);
+    const emitted = h.drainedTurns() as Array<{ turnId: string; assistantUuids: string[] }>;
+    expect(emitted.map(t => [t.turnId, t.assistantUuids])).toEqual([
+      ['om_first', ['a-text']],
+    ]);
+  });
+
+  it('keeps the original bound when new records belong to a FOLLOWING turn, not the bound one', () => {
+    // A type-ahead turn starting its tool call is activity for ANOTHER turn:
+    // it must not buy the bound turn extra time (or silence the fallback).
+    const h = harness({ heldWorking: true });
+    h.queue.mark('A', makeFingerprint('first'), 100, 'first', 1);
+    h.queue.ingest([user('u-a', 'first'), textFinal('a1')]);
+    h.update();
+    h.advance(1_500);
+    h.queue.mark('B', makeFingerprint('second'), 200, 'second');
+    h.queue.ingest([user('u-b', 'second'),
+      { type: 'assistant', uuid: 'b-tool', message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }], stop_reason: 'tool_use' } }]);
+    h.update();
+    h.advance(499); // t=1999
+    expect(h.drains()).toBe(0);
+    h.advance(2); // t=2001: still the ORIGINAL bound — A settles, B is untouched
+    const emitted = h.drainedTurns() as Array<{ turnId: string }>;
+    expect(emitted.map(t => t.turnId)).toEqual(['A']);
+    // B keeps running and later answers with its own attributed final.
+    h.queue.ingest([textFinal('b-answer', 'B actual answer'),
+      { type: 'system', subtype: 'turn_duration', uuid: 'd-b' }]);
+    expect(h.queue.drainEmittable({ explicitTerminalOnly: true })
+      .map(turn => [turn.turnId, turn.assistantUuids])).toEqual([['B', ['b-answer']]]);
+  });
+
+  it('re-arms the new head immediately when its bound turn already closed normally while armed', () => {
+    // The bound turn closes at the NEXT turn's user boundary (no marker yet,
+    // verdict still undecided) and the type-ahead B is already collecting its
+    // own first block. The stale deadline bound to A must not hold B's window
+    // to A's remainder: B gets a fresh bound anchored at its own ingest.
+    const h = harness({ heldWorking: true });
+    h.queue.mark('A', makeFingerprint('first'), 100, 'first', 1);
+    h.queue.ingest([user('u-a', 'first'), textFinal('a1')]);
+    h.update();
+    h.advance(500);
+    // B's user start boundary-closes A; B's first terminal block lands in the
+    // same read, with the marker verdict for this transcript still undecided.
+    h.queue.mark('B', makeFingerprint('second'), 200, 'second');
+    h.queue.ingest([user('u-b', 'second'), textFinal('b-part1', 'B part 1')]);
+    h.queue.drainEmittable({ terminalBoundary: true, requireExplicitTerminalForDurable: true }); // A out
+    h.update(); // B is the fresh head: A's stale deadline is replaced now
+    // B's window is anchored at its OWN block (t≈500), not A's arm (t=0):
+    // with the stale deadline B would not fire until t≈4000; the fresh arm
+    // fires right after t=2500.
+    h.advance(1_999);
+    expect(h.drains()).toBe(0);
+    h.advance(2);
+    expect((h.drainedTurns() as Array<{ turnId: string }>).map(t => t.turnId)).toEqual(['B']);
+  });
+
+  it('arms the next head fresh at the END of a fire that drained its bound turn', () => {
+    // The fire's own bridgeIngest can discover the bound turn's follower:
+    // B's user boundary-closes A and B's first terminal block is already on
+    // disk. The fire drains only A (onlyTurn gate withholds B); without the
+    // explicit end-of-fire re-arm B would then wait for a FUTURE ingest to
+    // arm it — its bound skew by up to one window (and the fire's self-arm
+    // against the pre-drain head was voided). B must leave the fire already
+    // holding its own full window.
+    const h = harness({ heldWorking: true });
+    h.queue.mark('A', makeFingerprint('first'), 100, 'first', 1);
+    h.queue.mark('B', makeFingerprint('second'), 200, 'second', 1);
+    h.queue.ingest([user('u-a', 'first'), textFinal('a1')]);
+    h.update();
+    // A's fire discovers B's start + first block in one read.
+    let pending: TranscriptEvent[] = [user('u-b', 'second'), textFinal('b-part1', 'B part 1')];
+    h.scope.bridgeIngest = () => { h.queue.ingest(pending.splice(0)); };
+    h.advance(2_001);
+    const first = h.drainedTurns() as Array<{ turnId: string }>;
+    expect(first.map(t => t.turnId)).toEqual(['A']); // only A emitted; B withheld
+    // B is armed with a fresh full window WITHOUT another external update:
+    // its deadline sits ~one full window after the fire (t≈4000), not at the
+    // fire itself. Assert via the armed handle the harness already mirrors
+    // and via B's fire time — no internal turn-binding reads.
+    expect(h.scope.provisionalExitTimer).not.toBeNull();
+    h.advance(1_998);
+    expect(h.drains()).toBe(1); // B's own bound has not fired yet
+    h.advance(3);
+    expect((h.drainedTurns() as Array<{ turnId: string }>).map(t => t.turnId)).toEqual(['A', 'B']);
+  });
+
+  it('a waitExpired verdict learned before a rotation does not strip the new generation first turn', () => {
+    // P3 from review: beyond the K3 structural guard, prove the generation
+    // boundary end-to-end through the real helper — old writer learns
+    // waitExpired, /clear-style rotation, new writer first turn stays fresh.
+    const h = harness();
+    h.queue.mark('old-A', makeFingerprint('first'), 100, 'first', 1);
+    h.queue.ingest([user('u-a', 'first'), textFinal('a1')]);
+    h.update();
+    h.advance(2_001); // old-A settles: this CLI is marked waitExpired
+    expect(h.drains()).toBe(1);
+    const beginGeneration = loadWorkerFunction<() => void>('beginNewBridgeTranscriptGeneration', h.scope);
+    h.scope.beginNewBridgeTranscriptGeneration = beginGeneration;
+    beginGeneration();
+    h.queue.mark('new-B', makeFingerprint('second'), 200, 'second', 1);
+    h.queue.ingest([user('u-b', 'second'), thinkingOnly('b-think')]);
+    expect(h.queue.isFreshHeadAwaitingMarker(h.queue.peek()[0])).toBe(true);
+    expect(h.queue.drainEmittable({ explicitTerminalOnly: true })).toEqual([]);
   });
 
   it('voids an old deadline when the head turn completes before it fires', () => {
@@ -614,5 +765,23 @@ describe('marker verdict lifecycle wiring guard', () => {
     expect(workerSrc).toMatch(/current !== boundTurn/);
     // Generation boundaries (teardown/start/switches) disarm the old timer.
     expect(workerSrc).toMatch(/function beginNewBridgeTranscriptGeneration[\s\S]{0,200}?disarmProvisionalExitWatch\(\);/);
+  });
+
+  it('arms ONLY from the tail of bridgeIngest — the sole production entry — and never for adopt/local turns', () => {
+    // Every behavior test above calls updateProvisionalExitWatch directly;
+    // none goes through bridgeIngest. Deleting this production call therefore
+    // went fully green while the no-idle fallback silently stopped existing
+    // (a fresh first turn hangs forever again). Pin the adjacency of the
+    // queue ingest and the arming call.
+    const workerSrc = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    expect(workerSrc).toMatch(
+      /bridgeQueue\.ingest\(result\.events, bridgeJsonlPath, observeThinkingAttribution\);\s*\n(?:\s*\/\/[^\n]*\n)*\s*updateProvisionalExitWatch\(\);/,
+    );
+    // Fallback scope is the Claude non-adopt transcript bridge only: adopt
+    // sessions and headless local turns are timed out by other paths.
+    expect(workerSrc).toMatch(/if \(!bridgeJsonlPath \|\| lastInitConfig\?\.adoptMode\) return;/);
+    expect(workerSrc).toMatch(/if \(!head \|\| head\.isLocal \|\| !bridgeQueue\.isFreshHeadAwaitingMarker\(head\)\) return;/);
+    // The bound restarts only on the bound turn's own new activity.
+    expect(workerSrc).toMatch(/provisionalExitBoundTurn === head/);
   });
 });
